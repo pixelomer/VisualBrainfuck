@@ -1,5 +1,3 @@
-// Something is horribly wrong but I don't know what it is yet. I'll look at it later.
-
 #include <stdio.h>
 #include <limits.h>
 #include <string.h>
