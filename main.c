@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <ncurses.h>
 #include <unistd.h>
+#include <signal.h>
 
 typedef int cell_t;
 
@@ -38,10 +39,10 @@ void redraw_code_window(void) {
 	long current_char_index = ftell(file);
 	long offset = 0-min(cursor_pos, current_char_index);
 	fseek(file, offset, SEEK_CUR);
-	for (int i = 0; i < max_x+1; i++) code_buffer[i] = ' ';
+	for (int i = 0; i < max_x; i++) code_buffer[i] = ' ';
 	long read = fread((code_buffer+(offset+cursor_pos)), 1, max_x-offset, file);
 	fseek(file, 0-read-offset, SEEK_CUR);
-	code_buffer[max_x] = 0;
+	code_buffer[max_x-1] = 0;
 	mvwprintw(code_window, 0, 0, "%s", code_buffer);
 	mvwprintw(code_window, 2, 0, "Current character: %ld", ftell(file));
 	wrefresh(code_window);
@@ -50,8 +51,8 @@ void redraw_code_window(void) {
 void redraw_cells_window(void) {
 	wclear(cells_window);
 	int max_y = min(getmaxy(cells_window), CELL_COUNT);
-	for (int i = 0; i < max_y; i++) {
-		mvwprintw(cells_window, i, 0, "Cell #%d ==> %d", i, first_cell[i*CELL_SIZE]);
+	for (int i = 0; ((i < max_y) && (i < CELL_COUNT)); i++) {
+		mvwprintw(cells_window, i, 0, "Cell #%d ==> %d", i, *(first_cell+(i*CELL_SIZE)));
 	}
 	wrefresh(cells_window);
 }
@@ -129,10 +130,7 @@ int main(int argc, char **argv) {
 		rewind(file);
 		fclose(input_file);
 	}
-	first_cell = malloc(CELL_BUFFER_SIZE);
-	for (int i = 0; i < CELL_BUFFER_SIZE; i+=CELL_SIZE) {
-		first_cell[i] = 0;
-	}
+	first_cell = calloc(CELL_COUNT, CELL_SIZE);
 	current_cell_pt = first_cell;
 	code_window = NULL;
 	output_window = NULL;
@@ -248,8 +246,6 @@ int main(int argc, char **argv) {
 			case 'q':
 				endwin();
 				return 0;
-			case 's':
-				break;
 		}
 	}
 }
