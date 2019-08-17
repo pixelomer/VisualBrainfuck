@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <ncurses.h>
 #include <unistd.h>
+#include <time.h>
 #include <signal.h>
 
 typedef int cell_t;
@@ -16,7 +17,11 @@ typedef int cell_t;
 #define CELL_SIZE sizeof(cell_t)
 #define CELL_BUFFER_SIZE (CELL_COUNT * sizeof(cell_t))
 
-static _Bool did_resize;
+static struct {
+    unsigned int step_by_step:1;
+	unsigned int did_resize:1;
+	unsigned int next_instruction:1;
+} options;
 static cell_t *first_cell;
 static cell_t *current_cell_pt;
 static WINDOW *code_window;
@@ -26,15 +31,22 @@ static WINDOW *input_window;
 static char *code_buffer;
 static char *output_buffer;
 static FILE *file;
+static useconds_t delay;
+static int ips;
 
 void handle_resize(int signal) {
-	did_resize = 1;
+	options.did_resize = 1;
+}
+
+void reload_options(void) {
+	
 }
 
 void redraw_code_window(void) {
 	wclear(code_window);
 	int max_x = min(getmaxx(stdscr), CODE_BUFFER_SIZE);
-	int cursor_pos = max_x / 2;
+	int cursor_pos = (max_x / 2);
+	cursor_pos = cursor_pos + !((cursor_pos * 2) == max_x);
 	mvwaddch(code_window, 1, (cursor_pos-1), '^');
 	long current_char_index = ftell(file);
 	long offset = 0-min(cursor_pos, current_char_index);
@@ -45,14 +57,18 @@ void redraw_code_window(void) {
 	code_buffer[max_x-1] = 0;
 	mvwprintw(code_window, 0, 0, "%s", code_buffer);
 	mvwprintw(code_window, 2, 0, "Current character: %ld", ftell(file));
+	if ((ips != -1) && !options.step_by_step) mvwprintw(code_window, 3, 0, "%d IPS", ips);
 	wrefresh(code_window);
 }
 
 void redraw_cells_window(void) {
 	wclear(cells_window);
 	int max_y = min(getmaxy(cells_window), CELL_COUNT);
-	for (int i = 0; ((i < max_y) && (i < CELL_COUNT)); i++) {
-		mvwprintw(cells_window, i, 0, "Cell #%d ==> %d", i, *(first_cell+(i*CELL_SIZE)));
+	int max_x = getmaxx(cells_window);
+	const char *format = "#%d ==> %d";
+	mvwprintw(cells_window, 0, 0, format, ((current_cell_pt-first_cell)/CELL_SIZE), *current_cell_pt);
+	for (int i = 0; ((i < max_y-1) && (i < CELL_COUNT-1)); i++) {
+		mvwprintw(cells_window, i+1, 0, format, i, *(first_cell+(i*CELL_SIZE)));
 	}
 	wrefresh(cells_window);
 }
@@ -65,7 +81,8 @@ void redraw_screen(void) {
 	getmaxyx(stdscr, screen_max_y, screen_max_x);
 	int cells_window_w = (screen_max_x/2)-4;
 	code_window = newwin(4, screen_max_x, 0, 0);
-	output_window = newwin(screen_max_y-8, cells_window_w, 6, screen_max_x-cells_window_w-2);
+	int offset = !(((screen_max_x / 2) * 2) == screen_max_x);
+	output_window = newwin(screen_max_y-8, cells_window_w+offset, 6, screen_max_x-cells_window_w-2-offset);
 	cells_window = newwin(screen_max_y-8, cells_window_w, 6, 2);
 	input_window = newwin(1, screen_max_x, screen_max_y-1, 0);
 	int i;
@@ -85,9 +102,11 @@ void redraw_screen(void) {
 	}
 	wrefresh(stdscr);
 	curs_set(0);
+	reload_options();
 	nodelay(stdscr, 1);
 	nodelay(input_window, 0);
 	wtimeout(input_window, -1);
+	keypad(stdscr, 1);
 	noecho();
 	scrollok(output_window, 1);
 }
@@ -99,6 +118,8 @@ void redraw_output_window(void) {
 }
 
 int main(int argc, char **argv) {
+	delay = 5000;
+	ips = -1;
 	if (argc <= 1) {
 		fprintf(stderr, "Usage: %s <program>\n  program: A file containing a brainfuck program or \"-\" to read from stdin.\n", argv[0]);
 		return 1;
@@ -135,7 +156,7 @@ int main(int argc, char **argv) {
 	code_window = NULL;
 	output_window = NULL;
 	cells_window = NULL;
-	did_resize = 0;
+	options.did_resize = 0;
 	initscr();
 	code_buffer = malloc(CODE_BUFFER_SIZE);
 	output_buffer = malloc(OUTPUT_BUFFER_SIZE);
@@ -143,10 +164,14 @@ int main(int argc, char **argv) {
 	signal(SIGWINCH, handle_resize);
 	redraw_screen();
 	_Bool did_get_to_eof = 0;
+	time_t start_time;
+	int executed_instruction_count = 0;
 	while (1) {
-		usleep(5000);
+		if (!executed_instruction_count) time(&start_time);
+		usleep(delay);
 		// Read the new character
-		if (!did_get_to_eof) {
+		if (!did_get_to_eof && (!options.step_by_step || options.next_instruction)) {
+			options.next_instruction = 0;
 			char input = (char)fgetc(file);
 			if (input == EOF) {
 				did_get_to_eof = 1;
@@ -233,19 +258,44 @@ int main(int argc, char **argv) {
 				}
 			}
 		}
-		if (did_resize) {
+		if (options.did_resize) {
 			redraw_screen();
-			did_resize = 0;
+			options.did_resize = 0;
 		}
 		redraw_code_window();
 		redraw_cells_window();
 		redraw_output_window();
 
-		char input = wgetch(stdscr);
+		int input = wgetch(stdscr);
 		switch (input) {
+			case 'Q':
 			case 'q':
 				endwin();
 				return 0;
+			case KEY_UP:
+				if (delay <= 5000) beep();
+				else delay -= 5000;
+				break;
+			case KEY_DOWN:
+				delay += 5000;
+				break;
+			case 'T':
+			case 't':
+				options.step_by_step = !options.step_by_step;
+				reload_options();
+				break;
+			case ' ':
+				if (options.step_by_step) {
+					options.next_instruction = 1;
+				}
+				break;
+		}
+
+		executed_instruction_count++;
+
+		if ((time(NULL) - start_time) >= 1) {
+			ips = executed_instruction_count;
+			executed_instruction_count = 0;
 		}
 	}
 }
