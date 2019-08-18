@@ -7,6 +7,7 @@
 #include <time.h>
 #include <signal.h>
 #include <getopt.h>
+#include <pthread.h>
 
 typedef int cell_t;
 
@@ -15,9 +16,6 @@ typedef int cell_t;
 #define CELL_COUNT 1024
 #define CELL_SIZE sizeof(cell_t)
 #define CELL_BUFFER_SIZE (CELL_COUNT * sizeof(cell_t))
-
-// Make this value higher if your screen is really big and has more than 0x400 columns. Highly unlikely.
-#define CODE_BUFFER_SIZE 0x400
 
 // Make this value higher if you want the interpreter to be able to display more than 0x1000 characters.
 // 0x1000 should be enough. When it is not enough, the oldest output will be deleted.
@@ -28,50 +26,191 @@ static struct {
 	unsigned int did_resize:1;
 	unsigned int next_instruction:1;
 	unsigned int no_curses:1;
-} options;
+	unsigned int did_get_to_eof:1;
+} flags;
 static cell_t *first_cell;
 static cell_t *current_cell_pt;
 static WINDOW *code_window;
 static WINDOW *output_window;
 static WINDOW *cells_window;
 static WINDOW *input_window;
-static char *code_buffer;
 static char *output_buffer;
-static FILE *file;
+static char *code;
+static char *instruction_pt;
+static char *previously_drawn_instruction_pt;
 static useconds_t delay;
 static int ips;
 static char *program_path;
+static pthread_t bf_thread;
+static pthread_mutex_t instruction_pt_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t input_cond = PTHREAD_COND_INITIALIZER;
+static long code_len;
+static _Bool should_read_input;
 
 void handle_resize(int signal) {
-	options.did_resize = 1;
+	flags.did_resize = 1;
+}
+
+void *execute_bf_code(void *arg) {
+#define return return NULL
+	time_t start_time;
+	int executed_instruction_count = 0;
+	char input = 0;
+	while ((input = *instruction_pt) != 0) {
+		if (!executed_instruction_count) time(&start_time);
+		if (delay) usleep(delay);
+		if (!flags.did_get_to_eof && (!flags.step_by_step || flags.next_instruction)) {
+			flags.next_instruction = 0;
+			pthread_mutex_lock(&instruction_pt_lock);
+			instruction_pt++;
+			pthread_mutex_unlock(&instruction_pt_lock);
+			char *tmp_instruction_pt = instruction_pt;
+			switch (input) {
+				case '<': {
+					if (!(current_cell_pt - first_cell)) {
+						current_cell_pt = first_cell + CELL_BUFFER_SIZE; // Simulate an overflow
+					}
+					else {
+						current_cell_pt -= CELL_SIZE;
+					}
+					break;
+				}
+				case '>': {
+					if ((current_cell_pt - first_cell) == CELL_BUFFER_SIZE) {
+						current_cell_pt = first_cell; // Simulate an overflow
+					}
+					else {
+						current_cell_pt += CELL_SIZE;
+					}
+					break;
+				}
+				case '+': {
+					(*current_cell_pt)++;
+					break;
+				}
+				case '-': {
+					(*current_cell_pt)--;
+					break;
+				}
+				case '.': {
+					if (flags.no_curses) {
+						printf("%c", *current_cell_pt);
+					}
+					else {
+						pthread_mutex_lock(&output_lock);
+						waddch(output_window, *current_cell_pt);
+						long len = strlen(output_buffer);
+						char *old_output_pt = output_buffer;
+						if (len >= (OUTPUT_BUFFER_SIZE - 1)) old_output_pt++;
+						sprintf(output_buffer, "%s%c", old_output_pt, (char)*current_cell_pt);
+						pthread_mutex_unlock(&output_lock);
+						wrefresh(output_window);
+					}
+					break;
+				}
+				case ',': {
+					if (flags.no_curses) {
+						cell_t user_input = (cell_t)fgetc(stdin);
+						if (user_input != EOF) {
+							*current_cell_pt = user_input;
+							break;
+						}
+						// ERROR: Received EOF from stdin, not going to modify the cell.
+					}
+					else {
+						should_read_input = 1;
+						pthread_mutex_lock(&input_mutex);
+						while (should_read_input) {
+							pthread_cond_wait(&input_cond, &input_mutex);
+						}
+						pthread_mutex_unlock(&input_mutex);
+					}
+					break;
+				}
+				case '[': {
+					if (!*current_cell_pt) {
+						long counter = 1;
+						while (counter > 0) {
+							if (tmp_instruction_pt >= (code+code_len-1)) return; // ERROR: Reached EOF before finding a matching bracket.
+							input = (*(++tmp_instruction_pt));
+							switch (input) {
+								case '[': counter++; break;
+								case ']': counter--; break;
+							}
+						}
+					}
+					pthread_mutex_lock(&instruction_pt_lock);
+					instruction_pt = tmp_instruction_pt;
+					pthread_mutex_unlock(&instruction_pt_lock);
+					break;
+				}
+				case ']': {
+					if (*current_cell_pt) {
+						long counter = 1;
+						tmp_instruction_pt--;
+						while (counter > 0) {
+							if (tmp_instruction_pt <= code) return; // ERROR: Reached EOF before finding a matching bracket.
+							input = (*(--tmp_instruction_pt));
+							switch (input) {
+								case '[': counter--; break;
+								case ']': counter++; break;
+							}
+						}
+					}
+					pthread_mutex_lock(&instruction_pt_lock);
+					instruction_pt = tmp_instruction_pt;
+					pthread_mutex_unlock(&instruction_pt_lock);
+					break;
+				}
+			}
+		}
+		else if (flags.no_curses) {
+			return;
+		}
+
+		executed_instruction_count++;
+
+		if ((time(NULL) - start_time) >= 1) {
+			ips = executed_instruction_count;
+			executed_instruction_count = 0;
+		}
+	}
+#undef return
+	return NULL;
 }
 
 void reload_options(void) {
 	
 }
 
-void redraw_code_window(void) {
-	if (options.no_curses) return;
+void redraw_code_window(char *code_pt) {
+	if (flags.no_curses) return;
+	if (previously_drawn_instruction_pt == code_pt) return;
 	wclear(code_window);
-	int max_x = min(getmaxx(stdscr), CODE_BUFFER_SIZE);
+	int max_x = getmaxx(stdscr);
 	int cursor_pos = (max_x / 2);
 	cursor_pos = cursor_pos + !((cursor_pos * 2) == max_x);
 	mvwaddch(code_window, 1, (cursor_pos-1), '^');
-	long current_char_index = ftell(file);
+	long current_char_index = code-code_pt;
 	long offset = 0-min(cursor_pos, current_char_index);
-	fseek(file, offset, SEEK_CUR);
+	char *code_buffer = malloc(max_x+1);
 	for (int i = 0; i < max_x; i++) code_buffer[i] = ' ';
-	long read = fread((code_buffer+(offset+cursor_pos)), 1, max_x-offset, file);
-	fseek(file, 0-read-offset, SEEK_CUR);
-	code_buffer[max_x-1] = 0;
+	/*
+	char *beginning_pt = code_pt+offset;//fseek(file, offset, SEEK_CUR);
+	long read = min((max_x-offset), (code_len-(code_pt-code)));
+	memcpy(code_buffer, beginning_pt, read);
+	*/
+	code_buffer[max_x] = 0;
 	mvwprintw(code_window, 0, 0, "%s", code_buffer);
-	mvwprintw(code_window, 2, 0, "Current character: %ld", ftell(file));
-	if ((ips != -1) && !options.step_by_step) mvwprintw(code_window, 3, 0, "%d IPS", ips);
+	mvwprintw(code_window, 2, 0, "Current character: %ld", code_pt-code+1);
+	if ((ips != -1) && !flags.step_by_step) mvwprintw(code_window, 3, 0, "%d IPS", ips);
 	wrefresh(code_window);
 }
 
 void redraw_cells_window(void) {
-	if (options.no_curses) return;
+	if (flags.no_curses) return;
 	wclear(cells_window);
 	int max_y = min(getmaxy(cells_window), CELL_COUNT);
 	int max_x = getmaxx(cells_window);
@@ -84,7 +223,7 @@ void redraw_cells_window(void) {
 }
 
 void redraw_screen(void) {
-	if (options.no_curses) return;
+	if (flags.no_curses) return;
 	endwin();
 	refresh();
 	clear();
@@ -123,9 +262,11 @@ void redraw_screen(void) {
 }
 
 void redraw_output_window(void) {
-	if (options.no_curses) return;
+	if (flags.no_curses) return;
 	wclear(output_window);
+	pthread_mutex_lock(&output_lock);
 	mvwprintw(output_window, 0, 0, output_buffer);
+	pthread_mutex_unlock(&output_lock);
 	wrefresh(output_window);
 }
 
@@ -143,8 +284,9 @@ void print_usage(_Bool should_exit) {
 }
 
 int main(int argc, char **argv) {
+	code_len = 0;
 	program_path = argv[0];
-	delay = 5000;
+	delay = 10;
 	ips = -1;
 	int file_path_index = 0;
 
@@ -161,10 +303,10 @@ int main(int argc, char **argv) {
 		while ((option = getopt_long(argc, argv, "hdnm:", long_opts, NULL)) != -1) {
 			switch (option) {
 				case 'd':
-					options.step_by_step = 1;
+					flags.step_by_step = 1;
 					break;
 				case 'n':
-					options.no_curses = 1;
+					flags.no_curses = 1;
 				case 'h':
 					delay = 0;
 					break;
@@ -181,7 +323,7 @@ int main(int argc, char **argv) {
 			}
 		}
 		// Do not expect proper code from me.
-		if (options.step_by_step && options.no_curses) {
+		if (flags.step_by_step && flags.no_curses) {
 			fprintf(stderr, "Error: You can't use --debug-mode and --no-curses at the same time.\n");
 			print_usage(1);
 		}
@@ -190,8 +332,7 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	// Create a temporary file that only contains the brainfuck characters using the input
-	file = NULL;
+	// Copy the program to memory
 	{
 		char *file_path = argv[file_path_index];
 		FILE *input_file = (!strcmp(file_path, "-")) ? stdin : fopen(file_path, "r");
@@ -199,11 +340,9 @@ int main(int argc, char **argv) {
 			fprintf(stderr, "%s: %s: Failed to open file for reading\n", argv[0], file_path);
 			return 2;
 		}
-		file = tmpfile();
-		if (!file) {
-			fprintf(stderr, "%s: Failed to create a temporary file for the program\n", argv[0]);
-			return 2;
-		}
+		long buffer_size = 256;
+		long written_bytes = 0;
+		code = malloc(buffer_size);
 		while (1) {
 			char input = fgetc(input_file);
 			if (input == EOF) break;
@@ -211,13 +350,21 @@ int main(int argc, char **argv) {
 			short len = strlen(valid_characters);
 			for (short i = 0; i < len; i++) {
 				if (valid_characters[i] == input) {
-					fputc(input, file);
+					if (written_bytes >= (buffer_size - 1)) {
+						buffer_size *= 2;
+						code = realloc(code, buffer_size);
+					}
+					code[written_bytes] = input;
+					written_bytes++;
 					if (minified_file) fputc(input, minified_file);
 					break;
 				}
 			}
 		}
-		rewind(file);
+		code[written_bytes] = 0;
+		code = realloc(code, written_bytes+1);
+		code_len = written_bytes;
+		instruction_pt = code;
 		fclose(input_file);
 		if (minified_file) {
 			fclose(minified_file);
@@ -228,137 +375,34 @@ int main(int argc, char **argv) {
 	current_cell_pt = first_cell;
 	code_window = NULL;
 	output_window = NULL;
+	should_read_input = 1;
 	cells_window = NULL;
-	options.did_resize = 0;
-	if (!options.no_curses) {
-		initscr();
-		code_buffer = malloc(CODE_BUFFER_SIZE);
+	flags.did_resize = 0;
+	if (!flags.no_curses) {
 		output_buffer = malloc(OUTPUT_BUFFER_SIZE);
 		output_buffer[0] = 0;
+		pthread_create(&bf_thread, NULL, execute_bf_code, NULL);
+		initscr();
 		signal(SIGWINCH, handle_resize);
 		redraw_screen();
 	}
-	_Bool did_get_to_eof = 0;
-	time_t start_time;
-	int executed_instruction_count = 0;
-	while (1) {
-		if (!executed_instruction_count) time(&start_time);
-		if (delay) usleep(delay);
-		// Read the new character
-		if (!did_get_to_eof && (!options.step_by_step || options.next_instruction)) {
-			options.next_instruction = 0;
-			char input = (char)fgetc(file);
-			if (input == EOF) {
-				did_get_to_eof = 1;
-				continue;
-			}
-			
-			// Handle the new character
-			switch (input) {
-				case '<': {
-					if (!(current_cell_pt - first_cell)) {
-						current_cell_pt = first_cell + CELL_BUFFER_SIZE; // Simulate an overflow
-					}
-					else {
-						current_cell_pt -= CELL_SIZE;
-					}
-					break;
-				}
-				case '>': {
-					if ((current_cell_pt - first_cell) == CELL_BUFFER_SIZE) {
-						current_cell_pt = first_cell; // Simulate an overflow
-					}
-					else {
-						current_cell_pt += CELL_SIZE;
-					}
-					break;
-				}
-				case '+': {
-					(*current_cell_pt)++;
-					break;
-				}
-				case '-': {
-					(*current_cell_pt)--;
-					break;
-				}
-				case '.': {
-					if (options.no_curses) {
-						printf("%c", *current_cell_pt);
-					}
-					else {
-						waddch(output_window, *current_cell_pt);
-						long len = strlen(output_buffer);
-						char *old_output_pt = output_buffer;
-						if (len >= (OUTPUT_BUFFER_SIZE - 1)) old_output_pt++;
-						sprintf(output_buffer, "%s%c", old_output_pt, (char)*current_cell_pt);
-						wrefresh(output_window);
-					}
-					break;
-				}
-				case ',': {
-					if (options.no_curses) {
-						if ((*current_cell_pt = (cell_t)fgetc(stdin)) == EOF) {
-							return 0;
-						}
-					}
-					else {
-						mvwprintw(input_window, 0, 0, "Program input: ");
-						curs_set(1);
-						wrefresh(input_window);
-						if ((*current_cell_pt = (cell_t)wgetch(input_window)) == ERR) {
-							*current_cell_pt = -1;
-						}
-						curs_set(0);
-						wclear(input_window);
-						wrefresh(input_window);
-					}
-					break;
-				}
-				case '[': {
-					if (!*current_cell_pt) {
-						long counter = 1;
-						while (counter > 0) {
-							input = (char)fgetc(file);
-							if (input == EOF) return 3;
-							switch (input) {
-								case EOF: return 3;
-								case '[': counter++; break;
-								case ']': counter--; break;
-							}
-						}
-					}
-					break;
-				}
-				case ']': {
-					if (*current_cell_pt) {
-						long counter = 1;
-						while (counter > 0) {
-							if (fseek(file, -2, SEEK_CUR) == -1) return 4;
-							input = (char)fgetc(file);
-							switch (input) {
-								case EOF: return 4;
-								case '[': counter--; break;
-								case ']': counter++; break;
-							}
-						}
-						fseek(file, -1, SEEK_CUR);
-					}
-					break;
-				}
-			}
-		}
-		else if (options.no_curses) {
-			return 0;
-		}
-
-		if (!options.no_curses) {
-			if (options.did_resize) {
+	else {
+		execute_bf_code(NULL);
+		return 0;
+	}
+	if (!flags.no_curses) {
+		while (1) {
+			if (flags.did_resize) {
 				redraw_screen();
-				options.did_resize = 0;
+				flags.did_resize = 0;
 			}
-			redraw_code_window();
+			pthread_mutex_lock(&instruction_pt_lock);
+			char *code_pt = instruction_pt;
+			pthread_mutex_unlock(&instruction_pt_lock);
+			redraw_code_window(code_pt);
 			redraw_cells_window();
 			redraw_output_window();
+			previously_drawn_instruction_pt = code_pt;
 
 			int input = wgetch(stdscr);
 			switch (input) {
@@ -368,30 +412,35 @@ int main(int argc, char **argv) {
 					return 0;
 				case KEY_UP:
 					if (delay <= 0) beep();
-					else delay -= 5000;
+					else delay -= 10;
 					break;
 				case KEY_DOWN:
 					if (delay >= 500000) beep();
-					else delay += 5000;
+					else delay += 10;
 					break;
 				case 'T':
 				case 't':
-					options.step_by_step = !options.step_by_step;
+					flags.step_by_step = !flags.step_by_step;
 					reload_options();
 					break;
 				case ' ':
-					if (options.step_by_step) {
-						options.next_instruction = 1;
+					if (flags.step_by_step) {
+						flags.next_instruction = 1;
 					}
 					break;
 			}
-		}
-
-		executed_instruction_count++;
-
-		if ((time(NULL) - start_time) >= 1) {
-			ips = executed_instruction_count;
-			executed_instruction_count = 0;
+			if (should_read_input) {
+				mvwprintw(input_window, 0, 0, "Program input: ");
+				curs_set(1);
+				wrefresh(input_window);
+				while ((*current_cell_pt = (cell_t)wgetch(input_window)) == ERR);
+				curs_set(0);
+				wclear(input_window);
+				wrefresh(input_window);
+				should_read_input = 0;
+				pthread_cond_signal(&input_cond);
+			}
+			usleep(20000);
 		}
 	}
 }
