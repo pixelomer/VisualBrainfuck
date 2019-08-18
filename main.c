@@ -27,6 +27,7 @@ static struct {
 	unsigned int next_instruction:1;
 	unsigned int no_curses:1;
 	unsigned int did_get_to_eof:1;
+	unsigned int should_read_input:1;
 } flags;
 static cell_t *first_cell;
 static cell_t *current_cell_pt;
@@ -37,7 +38,6 @@ static WINDOW *input_window;
 static char *output_buffer;
 static char *code;
 static char *instruction_pt;
-static char *previously_drawn_instruction_pt;
 static useconds_t delay;
 static int ips;
 static char *program_path;
@@ -47,7 +47,7 @@ static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t input_cond = PTHREAD_COND_INITIALIZER;
 static long code_len;
-static _Bool should_read_input;
+static char *last_drawn_code;
 
 void handle_resize(int signal) {
 	flags.did_resize = 1;
@@ -120,9 +120,9 @@ void *execute_bf_code(void *arg) {
 						// ERROR: Received EOF from stdin, not going to modify the cell.
 					}
 					else {
-						should_read_input = 1;
+						flags.should_read_input = 1;
 						pthread_mutex_lock(&input_mutex);
-						while (should_read_input) {
+						while (flags.should_read_input) {
 							pthread_cond_wait(&input_cond, &input_mutex);
 						}
 						pthread_mutex_unlock(&input_mutex);
@@ -181,32 +181,19 @@ void *execute_bf_code(void *arg) {
 	return NULL;
 }
 
-void reload_options(void) {
-	
-}
-
 void redraw_code_window(char *code_pt) {
 	if (flags.no_curses) return;
-	if (previously_drawn_instruction_pt == code_pt) return;
 	wclear(code_window);
 	int max_x = getmaxx(stdscr);
 	int cursor_pos = (max_x / 2);
 	cursor_pos = cursor_pos + !((cursor_pos * 2) == max_x);
 	mvwaddch(code_window, 1, (cursor_pos-1), '^');
-	long current_char_index = code-code_pt;
-	long offset = 0-min(cursor_pos, current_char_index);
-	char *code_buffer = malloc(max_x+1);
-	for (int i = 0; i < max_x; i++) code_buffer[i] = ' ';
-	/*
-	char *beginning_pt = code_pt+offset;//fseek(file, offset, SEEK_CUR);
-	long read = min((max_x-offset), (code_len-(code_pt-code)));
-	memcpy(code_buffer, beginning_pt, read);
-	*/
-	code_buffer[max_x] = 0;
+	char *code_buffer = malloc(max_x + 1);
 	mvwprintw(code_window, 0, 0, "%s", code_buffer);
 	mvwprintw(code_window, 2, 0, "Current character: %ld", code_pt-code+1);
-	if ((ips != -1) && !flags.step_by_step) mvwprintw(code_window, 3, 0, "%d IPS", ips);
+	if ((ips != -1) && !flags.step_by_step && !flags.did_get_to_eof) mvwprintw(code_window, 3, 0, "%d IPS", ips);
 	wrefresh(code_window);
+	free(code_buffer);
 }
 
 void redraw_cells_window(void) {
@@ -252,7 +239,6 @@ void redraw_screen(void) {
 	}
 	wrefresh(stdscr);
 	curs_set(0);
-	reload_options();
 	nodelay(stdscr, 1);
 	nodelay(input_window, 0);
 	wtimeout(input_window, -1);
@@ -375,7 +361,7 @@ int main(int argc, char **argv) {
 	current_cell_pt = first_cell;
 	code_window = NULL;
 	output_window = NULL;
-	should_read_input = 1;
+	flags.should_read_input = 1;
 	cells_window = NULL;
 	flags.did_resize = 0;
 	if (!flags.no_curses) {
@@ -402,7 +388,6 @@ int main(int argc, char **argv) {
 			redraw_code_window(code_pt);
 			redraw_cells_window();
 			redraw_output_window();
-			previously_drawn_instruction_pt = code_pt;
 
 			int input = wgetch(stdscr);
 			switch (input) {
@@ -421,7 +406,6 @@ int main(int argc, char **argv) {
 				case 'T':
 				case 't':
 					flags.step_by_step = !flags.step_by_step;
-					reload_options();
 					break;
 				case ' ':
 					if (flags.step_by_step) {
@@ -429,7 +413,7 @@ int main(int argc, char **argv) {
 					}
 					break;
 			}
-			if (should_read_input) {
+			if (flags.should_read_input) {
 				mvwprintw(input_window, 0, 0, "Program input: ");
 				curs_set(1);
 				wrefresh(input_window);
@@ -437,7 +421,7 @@ int main(int argc, char **argv) {
 				curs_set(0);
 				wclear(input_window);
 				wrefresh(input_window);
-				should_read_input = 0;
+				flags.should_read_input = 0;
 				pthread_cond_signal(&input_cond);
 			}
 			usleep(20000);
