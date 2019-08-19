@@ -16,13 +16,16 @@ typedef int cell_t;
 #define CELL_COUNT 1024
 #define CELL_SIZE sizeof(cell_t)
 #define CELL_BUFFER_SIZE (CELL_COUNT * sizeof(cell_t))
+#define MAX_DELAY 500000
+#define MIN_DELAY 10
+#define DELAY_INCREMENT MIN_DELAY
 
 // Make this value higher if you want the interpreter to be able to display more than 0x1000 characters.
 // 0x1000 should be enough. When it is not enough, the oldest output will be deleted.
 #define OUTPUT_BUFFER_SIZE 0x1000
 
 static struct {
-    unsigned int step_by_step:1;
+	unsigned int step_by_step:1;
 	unsigned int did_resize:1;
 	unsigned int next_instruction:1;
 	unsigned int no_curses:1;
@@ -47,7 +50,6 @@ static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t input_cond = PTHREAD_COND_INITIALIZER;
 static long code_len;
-static char *last_drawn_code;
 
 void handle_resize(int signal) {
 	flags.did_resize = 1;
@@ -169,9 +171,9 @@ void *execute_bf_code(void *arg) {
 		else if (flags.no_curses) {
 			return;
 		}
-
+		
 		executed_instruction_count++;
-
+		
 		if ((time(NULL) - start_time) >= 1) {
 			ips = executed_instruction_count;
 			executed_instruction_count = 0;
@@ -188,10 +190,16 @@ void redraw_code_window(char *code_pt) {
 	int cursor_pos = (max_x / 2);
 	cursor_pos = cursor_pos + !((cursor_pos * 2) == max_x);
 	mvwaddch(code_window, 1, (cursor_pos-1), '^');
-	char *code_buffer = malloc(max_x + 1);
+	char *code_buffer = malloc(max_x+1);
+	long current_char_index = code_pt-code;
+	long offset = 0-min(cursor_pos, current_char_index);
+	code_pt += offset;
+	for (int i = 0; i < max_x+1; i++) code_buffer[i] = ' ';
+	memcpy((code_buffer+(offset+cursor_pos)), code_pt, min(max_x-offset, strlen(code_pt)));
+	code_buffer[max_x-1] = 0;
 	mvwprintw(code_window, 0, 0, "%s", code_buffer);
 	mvwprintw(code_window, 2, 0, "Current character: %ld", code_pt-code+1);
-	if ((ips != -1) && !flags.step_by_step && !flags.did_get_to_eof) mvwprintw(code_window, 3, 0, "%d IPS", ips);
+	if ((ips != -1) && !flags.step_by_step && !flags.did_get_to_eof) mvwprintw(code_window, 3, 0, "Delay: %i usecs, %d IPS", delay, ips);
 	wrefresh(code_window);
 	free(code_buffer);
 }
@@ -258,14 +266,15 @@ void redraw_output_window(void) {
 
 void print_usage(_Bool should_exit) {
 	fprintf(stderr,
-		"Usage: %s [options] <program>\n"
-		"  program: A file containing a brainfuck program or \"-\" to read from stdin.\n"
-		"Options:\n"
-		"  -n, --no-curses: Don't use ncurses. This will make the program simply execute the brainfuck program and exit.\n"
-		"  -d, --debug-mode: Execute the program step by step. Use the space key to execute instructions. This can be toggled while running with the 't' key.\n"
-		"  -h, --highest-speed: Start the program at the highest speed. The speed can be changed with the up and down arrow keys while running. Enabled by default with --no-curses.\n"
-		"  -m, --minify: Minify the program and write it to the specified file.\n",
-		program_path);
+			"Usage: %s [options] <program>\n"
+			"  program: A file containing a brainfuck program or \"-\" to read from stdin.\n"
+			"Options:\n"
+			"  -n, --no-curses: Don't use ncurses. This will make the program simply execute the brainfuck program and exit.\n"
+			"  -d, --debug-mode: Execute the program step by step. Use the space key to execute instructions. This can be toggled while running with the 't' key.\n"
+			"  -h, --highest-speed: Start the program at the highest possible speed. Can cause instability in curses mode. The speed can be changed with the up and down arrow keys while running. Enabled by default with --no-curses.\n"
+			"  -m, --minify: Minify the program and write it to the specified file.\n"
+			"  -u, --delay: Can be used to specify the delay between instructions in microseconds. Has to be a positive multiple of 10.\n",
+			program_path);
 	if (should_exit) exit(1);
 }
 
@@ -275,7 +284,7 @@ int main(int argc, char **argv) {
 	delay = 10;
 	ips = -1;
 	int file_path_index = 0;
-
+	
 	// Parse the arguments
 	FILE *minified_file = NULL;
 	{
@@ -283,10 +292,13 @@ int main(int argc, char **argv) {
 			{"highest-speed", no_argument, NULL, 'h'},
 			{"debug-mode", no_argument, NULL, 'd'},
 			{"no-curses", no_argument, NULL, 'n'},
-			{"minify", required_argument, NULL, 'm'}
+			{"minify", required_argument, NULL, 'm'},
+			{"delay", required_argument, NULL, 'u'}
 		};
 		int option = 0;
-		while ((option = getopt_long(argc, argv, "hdnm:", long_opts, NULL)) != -1) {
+		_Bool did_manually_set_delay = 0;
+		while ((option = getopt_long(argc, argv, "hdnm:u:", long_opts, NULL)) != -1) {
+			long input;
 			switch (option) {
 				case 'd':
 					flags.step_by_step = 1;
@@ -294,7 +306,7 @@ int main(int argc, char **argv) {
 				case 'n':
 					flags.no_curses = 1;
 				case 'h':
-					delay = 0;
+					if (!did_manually_set_delay) delay = 0;
 					break;
 				case 'm':
 					if (minified_file) {
@@ -306,18 +318,26 @@ int main(int argc, char **argv) {
 						return 1;
 					}
 					break;
+				case 'u':
+					input = strtol(optarg, NULL, 0);
+					if ((input <= 0) || (input % DELAY_INCREMENT)) {
+						fprintf(stderr, "Error: Invalid delay\n");
+						print_usage(1);
+					}
+					delay = min(input, MAX_DELAY);
+					did_manually_set_delay = 1;
+					break;
 			}
 		}
-		// Do not expect proper code from me.
 		if (flags.step_by_step && flags.no_curses) {
 			fprintf(stderr, "Error: You can't use --debug-mode and --no-curses at the same time.\n");
-			print_usage(1);
+			return 1;
 		}
 		else if (optind != (file_path_index = (argc-1))) {
 			print_usage(1);
 		}
 	}
-
+	
 	// Copy the program to memory
 	{
 		char *file_path = argv[file_path_index];
@@ -361,7 +381,7 @@ int main(int argc, char **argv) {
 	current_cell_pt = first_cell;
 	code_window = NULL;
 	output_window = NULL;
-	flags.should_read_input = 1;
+	flags.should_read_input = 0;
 	cells_window = NULL;
 	flags.did_resize = 0;
 	if (!flags.no_curses) {
@@ -388,7 +408,7 @@ int main(int argc, char **argv) {
 			redraw_code_window(code_pt);
 			redraw_cells_window();
 			redraw_output_window();
-
+			
 			int input = wgetch(stdscr);
 			switch (input) {
 				case 'Q':
@@ -396,12 +416,13 @@ int main(int argc, char **argv) {
 					endwin();
 					return 0;
 				case KEY_UP:
-					if (delay <= 0) beep();
-					else delay -= 10;
+					if (delay <= MIN_DELAY) beep();
+					else if ((delay / 2) % DELAY_INCREMENT) delay -= DELAY_INCREMENT;
+					else delay /= 2;
 					break;
 				case KEY_DOWN:
-					if (delay >= 500000) beep();
-					else delay += 10;
+					if (delay >= MAX_DELAY) beep();
+					else delay = min(delay*2, MAX_DELAY);
 					break;
 				case 'T':
 				case 't':

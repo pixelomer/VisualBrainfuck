@@ -1,6 +1,6 @@
 CC = clang
 CFLAGS = -arch x86_64 -Wno-unused-command-line-argument
-LDFLAGS = -lncurses
+LDFLAGS = -lncurses -lpthread
 ifeq ($(shell uname),Darwin)
 LDFLAGS += -lSystem -mmacosx-version-min=10.8
 CFLAGS += -mmacosx-version-min=10.8
