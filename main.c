@@ -9,7 +9,7 @@
 #include <getopt.h>
 #include <pthread.h>
 
-typedef int cell_t;
+typedef unsigned char cell_t;
 
 #define min(a,b) ((a<b)?a:b)
 #define max(a,b) ((a<b)?b:a)
@@ -23,6 +23,7 @@ typedef int cell_t;
 // Make this value higher if you want the interpreter to be able to display more than 0x1000 characters.
 // 0x1000 should be enough. When it is not enough, the oldest output will be deleted.
 #define OUTPUT_BUFFER_SIZE 0x1000
+#define CODE_BUFFER_SIZE OUTPUT_BUFFER_SIZE
 
 static struct {
 	unsigned int step_by_step:1;
@@ -50,6 +51,7 @@ static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t input_cond = PTHREAD_COND_INITIALIZER;
 static long code_len;
+static char *code_buffer;
 
 void handle_resize(int signal) {
 	flags.did_resize = 1;
@@ -75,7 +77,7 @@ void *execute_bf_code(void *arg) {
 						current_cell_pt = first_cell + CELL_BUFFER_SIZE; // Simulate an overflow
 					}
 					else {
-						current_cell_pt -= CELL_SIZE;
+						current_cell_pt--;
 					}
 					break;
 				}
@@ -84,7 +86,7 @@ void *execute_bf_code(void *arg) {
 						current_cell_pt = first_cell; // Simulate an overflow
 					}
 					else {
-						current_cell_pt += CELL_SIZE;
+						current_cell_pt++;
 					}
 					break;
 				}
@@ -98,7 +100,7 @@ void *execute_bf_code(void *arg) {
 				}
 				case '.': {
 					if (flags.no_curses) {
-						printf("%c", *current_cell_pt);
+						putc(*current_cell_pt, stdout);
 					}
 					else {
 						pthread_mutex_lock(&output_lock);
@@ -114,10 +116,10 @@ void *execute_bf_code(void *arg) {
 				}
 				case ',': {
 					if (flags.no_curses) {
-						cell_t user_input = (cell_t)fgetc(stdin);
+						int user_input = fgetc(stdin);
 						if (user_input != EOF) {
-							*current_cell_pt = user_input;
-							break;
+							*current_cell_pt = (cell_t)user_input;
+							// Success
 						}
 						// ERROR: Received EOF from stdin, not going to modify the cell.
 					}
@@ -186,11 +188,10 @@ void *execute_bf_code(void *arg) {
 void redraw_code_window(char *code_pt) {
 	if (flags.no_curses) return;
 	wclear(code_window);
-	int max_x = getmaxx(stdscr);
+	int max_x = min(getmaxx(stdscr), CODE_BUFFER_SIZE);
 	int cursor_pos = (max_x / 2);
 	cursor_pos = cursor_pos + !((cursor_pos * 2) == max_x);
 	mvwaddch(code_window, 1, (cursor_pos-1), '^');
-	char *code_buffer = malloc(max_x+1);
 	long current_char_index = code_pt-code;
 	long offset = 0-min(cursor_pos, current_char_index);
 	code_pt += offset;
@@ -201,7 +202,6 @@ void redraw_code_window(char *code_pt) {
 	mvwprintw(code_window, 2, 0, "Current character: %ld", code_pt-code+1);
 	if ((ips != -1) && !flags.step_by_step && !flags.did_get_to_eof) mvwprintw(code_window, 3, 0, "Delay: %i usecs, %d IPS", delay, ips);
 	wrefresh(code_window);
-	free(code_buffer);
 }
 
 void redraw_cells_window(void) {
@@ -209,10 +209,10 @@ void redraw_cells_window(void) {
 	wclear(cells_window);
 	int max_y = min(getmaxy(cells_window), CELL_COUNT);
 	int max_x = getmaxx(cells_window);
-	const char *format = "#%d ==> %d";
-	mvwprintw(cells_window, 0, 0, format, ((current_cell_pt-first_cell)/CELL_SIZE), *current_cell_pt);
+	const char *format = "#%i ==> %i";
+	mvwprintw(cells_window, 0, 0, format, (unsigned int)((current_cell_pt-first_cell)/CELL_SIZE), (unsigned int)*current_cell_pt);
 	for (int i = 0; ((i < max_y-1) && (i < CELL_COUNT-1)); i++) {
-		mvwprintw(cells_window, i+1, 0, format, i, *(first_cell+(i*CELL_SIZE)));
+		mvwprintw(cells_window, i+1, 0, format, i, (unsigned int)first_cell[i]);
 	}
 	wrefresh(cells_window);
 }
@@ -284,6 +284,7 @@ int main(int argc, char **argv) {
 	delay = 10;
 	ips = -1;
 	int file_path_index = 0;
+	code_buffer = malloc(CODE_BUFFER_SIZE);
 	
 	// Parse the arguments
 	FILE *minified_file = NULL;
@@ -438,7 +439,12 @@ int main(int argc, char **argv) {
 				mvwprintw(input_window, 0, 0, "Program input: ");
 				curs_set(1);
 				wrefresh(input_window);
-				while ((*current_cell_pt = (cell_t)wgetch(input_window)) == ERR);
+				{
+					int user_input;
+					do user_input = wgetch(input_window);
+					while (user_input == ERR);
+					*current_cell_pt = (cell_t)user_input;
+				}
 				curs_set(0);
 				wclear(input_window);
 				wrefresh(input_window);
