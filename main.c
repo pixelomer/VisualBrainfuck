@@ -199,7 +199,7 @@ void redraw_code_window(char *code_pt) {
 	memcpy((code_buffer+(offset+cursor_pos)), code_pt, min(max_x-offset, strlen(code_pt)));
 	code_buffer[max_x-1] = 0;
 	mvwprintw(code_window, 0, 0, "%s", code_buffer);
-	mvwprintw(code_window, 2, 0, "Current character: %ld", code_pt-code+1);
+	mvwprintw(code_window, 2, 0, "Current character: %ld", code_pt-code-offset+1);
 	if ((ips != -1) && !flags.step_by_step && !flags.did_get_to_eof) mvwprintw(code_window, 3, 0, "Delay: %i usecs, %d IPS", delay, ips);
 	wrefresh(code_window);
 }
