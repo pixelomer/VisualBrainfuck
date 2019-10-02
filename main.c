@@ -39,6 +39,7 @@ static WINDOW *code_window;
 static WINDOW *output_window;
 static WINDOW *cells_window;
 static WINDOW *input_window;
+static WINDOW *status_window;
 static char *output_buffer;
 static char *code;
 static char *instruction_pt;
@@ -217,6 +218,14 @@ void redraw_cells_window(void) {
 	wrefresh(cells_window);
 }
 
+// TODO: Other states like "Waiting for input..." and "Execution completed."
+void refresh_state_window(void) {
+	if (flags.no_curses) return;
+	wclear(status_window);
+	mvwprintw(status_window, 0, 0, "Program is executing...");
+	wrefresh(status_window);
+}
+
 void redraw_screen(void) {
 	if (flags.no_curses) return;
 	endwin();
@@ -227,9 +236,10 @@ void redraw_screen(void) {
 	int cells_window_w = (screen_max_x/2)-4;
 	code_window = newwin(4, screen_max_x, 0, 0);
 	int offset = !(((screen_max_x / 2) * 2) == screen_max_x);
-	output_window = newwin(screen_max_y-8, cells_window_w+offset, 6, screen_max_x-cells_window_w-2-offset);
+	output_window = newwin(screen_max_y-10, cells_window_w+offset, 8, screen_max_x-cells_window_w-2-offset);
 	cells_window = newwin(screen_max_y-8, cells_window_w, 6, 2);
 	input_window = newwin(1, screen_max_x, screen_max_y-1, 0);
+	status_window = newwin(1, cells_window_w+offset, 6, screen_max_x-cells_window_w-2-offset);
 	int i;
 	for (i = 6; i < screen_max_y-2; i++) {
 		mvwaddch(stdscr, i, 0, '|');
@@ -244,6 +254,11 @@ void redraw_screen(void) {
 		mvwaddch(stdscr, y, 0, '+');
 		mvwaddch(stdscr, y, (screen_max_x/2), '+');
 		mvwaddch(stdscr, y, screen_max_x-1, '+');
+	}
+	mvwaddch(stdscr, 7, screen_max_x-1, '+');
+	mvwaddch(stdscr, 7, (screen_max_x/2), '+');
+	for (i = (screen_max_x/2)+1; i < screen_max_x-1; i++) {
+		mvwaddch(stdscr, 7, i, '-');
 	}
 	wrefresh(stdscr);
 	curs_set(0);
@@ -409,6 +424,7 @@ int main(int argc, char **argv) {
 			redraw_code_window(code_pt);
 			redraw_cells_window();
 			redraw_output_window();
+			refresh_state_window();
 			
 			int input = wgetch(stdscr);
 			switch (input) {
