@@ -75,7 +75,7 @@ void *execute_bf_code(void *arg) {
 			switch (input) {
 				case '<': {
 					if (!(current_cell_pt - first_cell)) {
-						current_cell_pt = first_cell + CELL_BUFFER_SIZE; // Simulate an overflow
+						current_cell_pt = first_cell + CELL_BUFFER_SIZE - 1; // Simulate an overflow
 					}
 					else {
 						current_cell_pt--;
@@ -83,7 +83,7 @@ void *execute_bf_code(void *arg) {
 					break;
 				}
 				case '>': {
-					if ((current_cell_pt - first_cell) == CELL_BUFFER_SIZE) {
+					if ((current_cell_pt - first_cell + 1) == CELL_BUFFER_SIZE) {
 						current_cell_pt = first_cell; // Simulate an overflow
 					}
 					else {
@@ -210,10 +210,12 @@ void redraw_cells_window(void) {
 	wclear(cells_window);
 	int max_y = min(getmaxy(cells_window), CELL_COUNT);
 	int max_x = getmaxx(cells_window);
-	const char *format = "#%i ==> %i";
-	mvwprintw(cells_window, 0, 0, format, (unsigned int)((current_cell_pt-first_cell)/CELL_SIZE), (unsigned int)*current_cell_pt);
-	for (int i = 0; ((i < max_y-1) && (i < CELL_COUNT-1)); i++) {
-		mvwprintw(cells_window, i+1, 0, format, i, (unsigned int)first_cell[i]);
+	for (int i = 0; ((i < max_y) && (i < CELL_COUNT)); i++) mvwprintw(cells_window, i, 3, "......");
+	mvwprintw(cells_window, 0, 0, "#%i ", (unsigned int)((current_cell_pt-first_cell)/CELL_SIZE));
+	mvwprintw(cells_window, 0, 10, "%03i", (unsigned int)*current_cell_pt);
+	for (int i = 0; ((i < max_y-1) && (i < CELL_COUNT)); i++) {
+		mvwprintw(cells_window, i+1, 0, "#%i ", i);
+		mvwprintw(cells_window, i+1, 10, "%03i", (unsigned int)first_cell[i]);
 	}
 	wrefresh(cells_window);
 }
@@ -233,32 +235,29 @@ void redraw_screen(void) {
 	clear();
 	int screen_max_x, screen_max_y;
 	getmaxyx(stdscr, screen_max_y, screen_max_x);
-	int cells_window_w = (screen_max_x/2)-4;
 	code_window = newwin(4, screen_max_x, 0, 0);
-	int offset = !(((screen_max_x / 2) * 2) == screen_max_x);
-	output_window = newwin(screen_max_y-10, cells_window_w+offset, 8, screen_max_x-cells_window_w-2-offset);
-	cells_window = newwin(screen_max_y-8, cells_window_w, 6, 2);
+	output_window = newwin(screen_max_y-10, screen_max_x-21, 8, 19);
+	cells_window = newwin(screen_max_y-8, 13, 6, 2);
 	input_window = newwin(1, screen_max_x, screen_max_y-1, 0);
-	status_window = newwin(1, cells_window_w+offset, 6, screen_max_x-cells_window_w-2-offset);
-	int i;
-	for (i = 6; i < screen_max_y-2; i++) {
-		mvwaddch(stdscr, i, 0, '|');
-		mvwaddch(stdscr, i, (screen_max_x/2), '|');
-		mvwaddch(stdscr, i, screen_max_x-1, '|');
-	}
-	for (int j = 0; j < 2; j++) {
-		int y = (5+(j*(i-5)));
-		for (int k = 0; k < screen_max_x; k++) {
-			mvaddch(y, k, '-');
+	status_window = newwin(1, screen_max_x-21, 6, 19);
+	{
+		int j, i;
+		int y[] = { 5, 7, screen_max_y-2 };
+		int x[] = { 0, 17, screen_max_x-1 };
+		for (i = 0; i < (sizeof(x) / sizeof(*x)); i++) {
+			for (j = 6; j < screen_max_y-1; j++) {
+				mvwaddch(stdscr, j, x[i], '|');
+			}
 		}
-		mvwaddch(stdscr, y, 0, '+');
-		mvwaddch(stdscr, y, (screen_max_x/2), '+');
-		mvwaddch(stdscr, y, screen_max_x-1, '+');
-	}
-	mvwaddch(stdscr, 7, screen_max_x-1, '+');
-	mvwaddch(stdscr, 7, (screen_max_x/2), '+');
-	for (i = (screen_max_x/2)+1; i < screen_max_x-1; i++) {
-		mvwaddch(stdscr, 7, i, '-');
+		for (i = 0; i < (sizeof(y) / sizeof(*y)); i++) {
+			for (j = ((i==1) * 17); j < screen_max_x; j++) {
+				mvaddch(y[i], j, '-');
+			}
+			for (j = 0; j < (sizeof(x) / sizeof(*x)); j++) {
+				mvwaddch(stdscr, y[i], x[j], '+');
+			}
+		}
+		mvwaddch(stdscr, y[1], x[0], '|');
 	}
 	wrefresh(stdscr);
 	curs_set(0);
