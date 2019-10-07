@@ -9,7 +9,7 @@
 #include <getopt.h>
 #include <pthread.h>
 
-typedef unsigned char cell_t;
+typedef uint8_t cell_t;
 
 #define min(a,b) ((a<b)?a:b)
 #define max(a,b) ((a<b)?b:a)
@@ -32,13 +32,14 @@ static struct {
 	unsigned int no_curses:1;
 	unsigned int did_get_to_eof:1;
 	unsigned int should_read_input:1;
+	unsigned int execution_completed:1;
 } flags;
 static cell_t *first_cell;
 static cell_t *current_cell_pt;
 static WINDOW *code_window;
 static WINDOW *output_window;
 static WINDOW *cells_window;
-static WINDOW *input_window;
+//static WINDOW *input_window;
 static WINDOW *status_window;
 static char *output_buffer;
 static char *code;
@@ -59,10 +60,11 @@ void handle_resize(int signal) {
 }
 
 void *execute_bf_code(void *arg) {
-#define return return NULL
+#define return { flags.execution_completed = 1; return NULL; }
 	time_t start_time;
 	int executed_instruction_count = 0;
 	char input = 0;
+	flags.execution_completed = 0;
 	while ((input = *instruction_pt) != 0) {
 		if (!executed_instruction_count) time(&start_time);
 		if (delay) usleep(delay);
@@ -73,7 +75,7 @@ void *execute_bf_code(void *arg) {
 			pthread_mutex_unlock(&instruction_pt_lock);
 			char *tmp_instruction_pt = instruction_pt;
 			switch (input) {
-				case '<': {
+				case '<':
 					if (!(current_cell_pt - first_cell)) {
 						current_cell_pt = first_cell + CELL_BUFFER_SIZE - 1; // Simulate an overflow
 					}
@@ -81,8 +83,7 @@ void *execute_bf_code(void *arg) {
 						current_cell_pt--;
 					}
 					break;
-				}
-				case '>': {
+				case '>':
 					if ((current_cell_pt - first_cell + 1) == CELL_BUFFER_SIZE) {
 						current_cell_pt = first_cell; // Simulate an overflow
 					}
@@ -90,16 +91,13 @@ void *execute_bf_code(void *arg) {
 						current_cell_pt++;
 					}
 					break;
-				}
-				case '+': {
+				case '+':
 					(*current_cell_pt)++;
 					break;
-				}
-				case '-': {
+				case '-':
 					(*current_cell_pt)--;
 					break;
-				}
-				case '.': {
+				case '.':
 					if (flags.no_curses) {
 						putc(*current_cell_pt, stdout);
 					}
@@ -114,8 +112,7 @@ void *execute_bf_code(void *arg) {
 						wrefresh(output_window);
 					}
 					break;
-				}
-				case ',': {
+				case ',':
 					if (flags.no_curses) {
 						int user_input = fgetc(stdin);
 						if (user_input != EOF) {
@@ -133,13 +130,33 @@ void *execute_bf_code(void *arg) {
 						pthread_mutex_unlock(&input_mutex);
 					}
 					break;
-				}
-				case '[': {
+				case '[':
 					if (!*current_cell_pt) {
 						long counter = 1;
+					#if DEBUG
+						int lcount = 0;
+					#endif
 						while (counter > 0) {
-							if (tmp_instruction_pt >= (code+code_len-1)) return; // ERROR: Reached EOF before finding a matching bracket.
-							input = (*(++tmp_instruction_pt));
+						#if DEBUG
+							lcount++;
+						#endif
+							if (tmp_instruction_pt >= (code+code_len-1)) {
+							#if DEBUG
+								if (!flags.no_curses) endwin();
+								const char *message = "Failed to find the matching ']'. This might be a bug.";
+								fprintf(stderr, "\n");
+							#define print_borders() for (counter = 0; counter < strlen(message); counter++) fputc('=', stderr);
+								print_borders();
+								fprintf(stderr, "\n%s\nDEBUG INFO:\n tmp_instruction_pt: %p\n code: %p\n code_len: %ld\n code+code_len-1: %p\n lcount: %d\n", message, (void *)tmp_instruction_pt, (void *)code, code_len, (void *)(code+code_len-1), lcount);
+								print_borders();
+								fputc('\n', stderr);
+							#undef print_borders
+								exit(6);
+							#else
+								return;
+							#endif
+							}
+							input = (*(tmp_instruction_pt++));
 							switch (input) {
 								case '[': counter++; break;
 								case ']': counter--; break;
@@ -150,8 +167,7 @@ void *execute_bf_code(void *arg) {
 					instruction_pt = tmp_instruction_pt;
 					pthread_mutex_unlock(&instruction_pt_lock);
 					break;
-				}
-				case ']': {
+				case ']':
 					if (*current_cell_pt) {
 						long counter = 1;
 						tmp_instruction_pt--;
@@ -168,7 +184,17 @@ void *execute_bf_code(void *arg) {
 					instruction_pt = tmp_instruction_pt;
 					pthread_mutex_unlock(&instruction_pt_lock);
 					break;
-				}
+				case '?':
+					*current_cell_pt = (cell_t)arc4random_uniform(256);
+					break;
+				default:
+					if (flags.no_curses) {
+						fprintf(stderr, "Illegal instruction: %c\n", input);
+						exit(4);
+					}
+					else {
+						flags.step_by_step = 1;
+					}
 			}
 		}
 		else if (flags.no_curses) {
@@ -182,8 +208,8 @@ void *execute_bf_code(void *arg) {
 			executed_instruction_count = 0;
 		}
 	}
+	return;
 #undef return
-	return NULL;
 }
 
 void redraw_code_window(char *code_pt) {
@@ -220,11 +246,10 @@ void redraw_cells_window(void) {
 	wrefresh(cells_window);
 }
 
-// TODO: Other states like "Waiting for input..." and "Execution completed."
 void refresh_state_window(void) {
 	if (flags.no_curses) return;
 	wclear(status_window);
-	mvwprintw(status_window, 0, 0, "Program is executing...");
+	mvwprintw(status_window, 0, 0, (flags.execution_completed ? "Execution completed." : "Program is executing..."));
 	wrefresh(status_window);
 }
 
@@ -238,7 +263,7 @@ void redraw_screen(void) {
 	code_window = newwin(4, screen_max_x, 0, 0);
 	output_window = newwin(screen_max_y-10, screen_max_x-21, 8, 19);
 	cells_window = newwin(screen_max_y-8, 13, 6, 2);
-	input_window = newwin(1, screen_max_x, screen_max_y-1, 0);
+	//input_window = newwin(1, screen_max_x, screen_max_y-1, 0);
 	status_window = newwin(1, screen_max_x-21, 6, 19);
 	{
 		int j, i;
@@ -262,8 +287,8 @@ void redraw_screen(void) {
 	wrefresh(stdscr);
 	curs_set(0);
 	nodelay(stdscr, 1);
-	nodelay(input_window, 0);
-	wtimeout(input_window, -1);
+	//nodelay(input_window, 0);
+	//wtimeout(input_window, -1);
 	keypad(stdscr, 1);
 	noecho();
 	scrollok(output_window, 1);
@@ -274,6 +299,7 @@ void redraw_output_window(void) {
 	wclear(output_window);
 	pthread_mutex_lock(&output_lock);
 	mvwprintw(output_window, 0, 0, output_buffer);
+	waddch(output_window, (' ' | A_REVERSE));
 	pthread_mutex_unlock(&output_lock);
 	wrefresh(output_window);
 }
@@ -287,7 +313,8 @@ void print_usage(_Bool should_exit) {
 			"  -d, --debug-mode: Execute the program step by step. Use the space key to execute instructions. This can be toggled while running with the 't' key.\n"
 			"  -h, --highest-speed: Start the program at the highest possible speed. Can cause instability in curses mode. The speed can be changed with the up and down arrow keys while running. Enabled by default with --no-curses.\n"
 			"  -m, --minify: Minify the program and write it to the specified file.\n"
-			"  -u, --delay: Can be used to specify the delay between instructions in microseconds. Has to be a positive multiple of 10.\n",
+			"  -u, --delay: Can be used to specify the delay between instructions in microseconds. Has to be a positive multiple of 10.\n"
+			"  -s, --support: Add support for the specified characters. If an instruction doesn't have an implementation, specifying it will cause errors during execution. Example: -s \"s@\"\n",
 			program_path);
 	if (should_exit) exit(1);
 }
@@ -298,6 +325,8 @@ int main(int argc, char **argv) {
 	delay = 10;
 	ips = -1;
 	int file_path_index = 0;
+	char *valid_characters = malloc(9);
+	strcpy(valid_characters, "[]-+<>,.");
 	code_buffer = malloc(CODE_BUFFER_SIZE);
 	
 	// Parse the arguments
@@ -308,11 +337,12 @@ int main(int argc, char **argv) {
 			{"debug-mode", no_argument, NULL, 'd'},
 			{"no-curses", no_argument, NULL, 'n'},
 			{"minify", required_argument, NULL, 'm'},
-			{"delay", required_argument, NULL, 'u'}
+			{"delay", required_argument, NULL, 'u'},
+			{"support", required_argument, NULL, 's'}
 		};
 		int option = 0;
 		_Bool did_manually_set_delay = 0;
-		while ((option = getopt_long(argc, argv, "hdnm:u:", long_opts, NULL)) != -1) {
+		while ((option = getopt_long(argc, argv, "hdnm:u:s:", long_opts, NULL)) != -1) {
 			long input;
 			switch (option) {
 				case 'd':
@@ -342,6 +372,23 @@ int main(int argc, char **argv) {
 					delay = min(input, MAX_DELAY);
 					did_manually_set_delay = 1;
 					break;
+				case 's': {
+					int optarg_size = strlen(optarg);
+					char new_chars[optarg_size+1];
+					new_chars[optarg_size] = 0;
+					int nc_index = 0;
+					for (int opt_index = 0; opt_index < optarg_size; opt_index++) {
+						char c = optarg[opt_index];
+						if ((c >= 0x20) && (c <= 0x7E)) {
+							new_chars[nc_index++] = c;
+						}
+					}
+					new_chars[nc_index] = 0;
+					char *old_chars = valid_characters;
+					valid_characters = malloc(strlen(old_chars) + strlen(new_chars) + 1);
+					sprintf(valid_characters, "%s%s", old_chars, new_chars);
+					free(old_chars);
+				}
 			}
 		}
 		if (flags.step_by_step && flags.no_curses) {
@@ -367,7 +414,6 @@ int main(int argc, char **argv) {
 		while (1) {
 			char input = fgetc(input_file);
 			if (input == EOF) break;
-			const char *valid_characters = "[]-+<>,.";
 			short len = strlen(valid_characters);
 			for (short i = 0; i < len; i++) {
 				if (valid_characters[i] == input) {
@@ -450,6 +496,7 @@ int main(int argc, char **argv) {
 					}
 					break;
 			}
+			/*
 			if (flags.should_read_input) {
 				mvwprintw(input_window, 0, 0, "Program input: ");
 				curs_set(1);
@@ -466,6 +513,7 @@ int main(int argc, char **argv) {
 				flags.should_read_input = 0;
 				pthread_cond_signal(&input_cond);
 			}
+			*/
 			usleep(20000);
 		}
 	}
