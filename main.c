@@ -133,29 +133,8 @@ void *execute_bf_code(void *arg) {
 				case '[':
 					if (!*current_cell_pt) {
 						long counter = 1;
-					#if DEBUG
-						int lcount = 0;
-					#endif
 						while (counter > 0) {
-						#if DEBUG
-							lcount++;
-						#endif
-							if (tmp_instruction_pt >= (code+code_len-1)) {
-							#if DEBUG
-								if (!flags.no_curses) endwin();
-								const char *message = "Failed to find the matching ']'. This might be a bug.";
-								fprintf(stderr, "\n");
-							#define print_borders() for (counter = 0; counter < strlen(message); counter++) fputc('=', stderr);
-								print_borders();
-								fprintf(stderr, "\n%s\nDEBUG INFO:\n tmp_instruction_pt: %p\n code: %p\n code_len: %ld\n code+code_len-1: %p\n lcount: %d\n", message, (void *)tmp_instruction_pt, (void *)code, code_len, (void *)(code+code_len-1), lcount);
-								print_borders();
-								fputc('\n', stderr);
-							#undef print_borders
-								exit(6);
-							#else
-								return;
-							#endif
-							}
+							if (tmp_instruction_pt >= (code+code_len-1)) return; // ERROR: Reached EOF before finding a matching bracket.
 							input = (*(tmp_instruction_pt++));
 							switch (input) {
 								case '[': counter++; break;
