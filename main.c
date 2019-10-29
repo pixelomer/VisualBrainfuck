@@ -2,27 +2,26 @@
 #include <limits.h>
 #include <string.h>
 #include <stdlib.h>
-#include <ncurses.h>
+#include <curses.h>
 #include <unistd.h>
 #include <time.h>
 #include <signal.h>
 #include <getopt.h>
 #include <pthread.h>
+#include <errno.h>
 
 typedef uint8_t cell_t;
 
 #define min(a,b) ((a<b)?a:b)
 #define max(a,b) ((a<b)?b:a)
-#define CELL_COUNT 1024
+#define CELL_COUNT 4096
 #define CELL_SIZE sizeof(cell_t)
 #define CELL_BUFFER_SIZE (CELL_COUNT * sizeof(cell_t))
 #define MAX_DELAY 500000
 #define MIN_DELAY 10
 #define DELAY_INCREMENT MIN_DELAY
 
-// Make this value higher if you want the interpreter to be able to display more than 0x1000 characters.
-// 0x1000 should be enough. When it is not enough, the oldest output will be deleted.
-#define OUTPUT_BUFFER_SIZE 0x1000
+#define OUTPUT_BUFFER_SIZE 0x2000
 #define CODE_BUFFER_SIZE OUTPUT_BUFFER_SIZE
 
 static struct {
@@ -59,7 +58,23 @@ void handle_resize(int signal) {
 	flags.did_resize = 1;
 }
 
-void *execute_bf_code(void *arg) {
+static void bf_putc(int c) {
+	if (flags.no_curses) {
+		putc(c, stdout);
+	}
+	else {
+		pthread_mutex_lock(&output_lock);
+		waddch(output_window, c);
+		long len = strlen(output_buffer);
+		char *old_output_pt = output_buffer;
+		if (len >= (OUTPUT_BUFFER_SIZE - 1)) old_output_pt++;
+		sprintf(output_buffer, "%s%c", old_output_pt, (char)c);
+		pthread_mutex_unlock(&output_lock);
+		wrefresh(output_window);
+	}
+}
+
+static void *execute_bf_code(void *arg) {
 #define return { flags.execution_completed = 1; return NULL; }
 	time_t start_time;
 	int executed_instruction_count = 0;
@@ -98,19 +113,7 @@ void *execute_bf_code(void *arg) {
 					(*current_cell_pt)--;
 					break;
 				case '.':
-					if (flags.no_curses) {
-						putc(*current_cell_pt, stdout);
-					}
-					else {
-						pthread_mutex_lock(&output_lock);
-						waddch(output_window, *current_cell_pt);
-						long len = strlen(output_buffer);
-						char *old_output_pt = output_buffer;
-						if (len >= (OUTPUT_BUFFER_SIZE - 1)) old_output_pt++;
-						sprintf(output_buffer, "%s%c", old_output_pt, (char)*current_cell_pt);
-						pthread_mutex_unlock(&output_lock);
-						wrefresh(output_window);
-					}
+					bf_putc(*current_cell_pt);
 					break;
 				case ',':
 					if (flags.no_curses) {
@@ -228,7 +231,17 @@ void redraw_cells_window(void) {
 void refresh_state_window(void) {
 	if (flags.no_curses) return;
 	wclear(status_window);
-	mvwprintw(status_window, 0, 0, (flags.execution_completed ? "Execution completed." : "Program is executing..."));
+	const char *state = "Program is executing...";
+	if (getmaxy(stdscr) <= 10) {
+		state = "Window too small";
+	}
+	else if (flags.execution_completed) {
+		state = "Execution completed.";
+	}
+	else if (flags.should_read_input) {
+		state = "Waiting for input...";
+	}
+	mvwprintw(status_window, 0, 0, state);
 	wrefresh(status_window);
 }
 
@@ -288,13 +301,19 @@ void print_usage(_Bool should_exit) {
 			"Usage: %s [options] <program>\n"
 			"  program: A file containing a brainfuck program or \"-\" to read from stdin.\n"
 			"Options:\n"
-			"  -n, --no-curses: Don't use ncurses. This will make the program simply execute the brainfuck program and exit.\n"
-			"  -d, --debug-mode: Execute the program step by step. Use the space key to execute instructions. This can be toggled while running with the 't' key.\n"
-			"  -h, --highest-speed: Start the program at the highest possible speed. Can cause instability in curses mode. The speed can be changed with the up and down arrow keys while running. Enabled by default with --no-curses.\n"
-			"  -m, --minify: Minify the program and write it to the specified file.\n"
-			"  -u, --delay: Can be used to specify the delay between instructions in microseconds. Has to be a positive multiple of 10.\n"
-			"  -s, --support: Add support for the specified characters. If an instruction doesn't have an implementation, specifying it will cause errors during execution. Example: -s \"s@\"\n",
-			program_path);
+			"  -n, --no-curses: Don't show the debugger.\n"
+			"  -d, --debug-mode: Start in step-by-step mode.\n"
+			"  -h, --highest-speed: Run at the highest speed possible.\n"
+			"  -u, --delay: Specify a delay between instructions. Has to be a positive multiple of 10.\n"
+			"  -s, --support: Allow the usage of brainfuck extensions like '?'.\n"
+			"  -x, --exit: Exit after writing creating the output file. Has no effect without -o.\n"
+			"  -o, --output: Specify an output file for other file modifiers.\n"
+			"  -r, --refresh-rate: Specify the refresh rate for the screen.\n"
+			"File Modifiers:\n"
+			"  -f, --force-write: Overwrite the file if it exists.\n"
+			"  -m, --minify: Minify the program.\n"
+			//"  -c, --compress: Compress the program using a custom format.\n"
+			, program_path);
 	if (should_exit) exit(1);
 }
 
@@ -309,19 +328,30 @@ int main(int argc, char **argv) {
 	code_buffer = malloc(CODE_BUFFER_SIZE);
 	
 	// Parse the arguments
-	FILE *minified_file = NULL;
+	FILE *output_file = NULL;
+	char output_modifier = 0;
+	_Bool write_and_exit = 0;
+	char write_file_mode[3];
+	write_file_mode[0] = 'w';
+	write_file_mode[1] = 'x';
+	write_file_mode[2] = 0;
 	{
 		static struct option long_opts[] = {
 			{"highest-speed", no_argument, NULL, 'h'},
 			{"debug-mode", no_argument, NULL, 'd'},
 			{"no-curses", no_argument, NULL, 'n'},
-			{"minify", required_argument, NULL, 'm'},
+			{"minify", no_argument, NULL, 'm'},
 			{"delay", required_argument, NULL, 'u'},
-			{"support", required_argument, NULL, 's'}
+			{"support", required_argument, NULL, 's'},
+			{"output", required_argument, NULL, 'o'},
+			{"exit", no_argument, NULL, 'x'},
+			{"force-write", no_argument, NULL, 'f'},
+			{"refresh-rate", required_argument, NULL, 'r'},
+			//{"compress", no_argument, NULL, 'c'}
 		};
 		int option = 0;
 		_Bool did_manually_set_delay = 0;
-		while ((option = getopt_long(argc, argv, "hdnm:u:s:", long_opts, NULL)) != -1) {
+		while ((option = getopt_long(argc, argv, "hdnmu:s:o:xcfr:", long_opts, NULL)) != -1) {
 			long input;
 			switch (option) {
 				case 'd':
@@ -332,15 +362,26 @@ int main(int argc, char **argv) {
 				case 'h':
 					if (!did_manually_set_delay) delay = 0;
 					break;
-				case 'm':
-					if (minified_file) {
-						fprintf(stderr, "Error: You can specify the --minify option only once.\n");
+				case 'o':
+					if (output_file) {
+						fprintf(stderr, "Error: You can specify the --output option only once.\n");
 						print_usage(1);
 					}
-					else if (!(minified_file = fopen(optarg ?: "", "w"))) {
-						fprintf(stderr, "%s: %s: Failed to open file for writing\n", program_path, optarg);
+					else if (!(output_file = fopen(optarg ?: "", write_file_mode))) {
+						fprintf(stderr, "%s: %s: %s\n", program_path, strerror(errno) ?: "Failed to open file for writing", optarg);
 						return 1;
 					}
+					break;
+				case 'm':
+				case 'c':
+					if (output_modifier) {
+						fprintf(stderr, "Error: You can specify only one file modifier.\n");
+						return 1;
+					}
+					output_modifier = option;
+					break;
+				case 'x':
+					write_and_exit = 1;
 					break;
 				case 'u':
 					input = strtol(optarg, NULL, 0);
@@ -350,6 +391,9 @@ int main(int argc, char **argv) {
 					}
 					delay = min(input, MAX_DELAY);
 					did_manually_set_delay = 1;
+					break;
+				case 'f': // FIXME: Only works when placed before --output
+					write_file_mode[1] = 0;
 					break;
 				case 's': {
 					int optarg_size = strlen(optarg);
@@ -380,9 +424,10 @@ int main(int argc, char **argv) {
 	}
 	
 	// Copy the program to memory
+	FILE *input_file = NULL;
 	{
 		char *file_path = argv[file_path_index];
-		FILE *input_file = (!strcmp(file_path, "-")) ? stdin : fopen(file_path, "r");
+		input_file = (!strcmp(file_path, "-")) ? stdin : fopen(file_path, "r");
 		if (!input_file) {
 			fprintf(stderr, "%s: %s: Failed to open file for reading\n", argv[0], file_path);
 			return 2;
@@ -402,7 +447,6 @@ int main(int argc, char **argv) {
 					}
 					code[written_bytes] = input;
 					written_bytes++;
-					if (minified_file) fputc(input, minified_file);
 					break;
 				}
 			}
@@ -411,12 +455,38 @@ int main(int argc, char **argv) {
 		code = realloc(code, written_bytes+1);
 		code_len = written_bytes;
 		instruction_pt = code;
-		fclose(input_file);
-		if (minified_file) {
-			fclose(minified_file);
-			minified_file = NULL;
-		}
 	}
+	if (output_file) {
+		fseek(input_file, SEEK_SET, 0);
+		int current_char = -1;
+		do {
+			current_char = fgetc(input_file);
+			uint8_t *algorithm_data = NULL;
+			switch (output_modifier) {
+				case 'm':
+					if (!algorithm_data) {
+						algorithm_data = malloc(sizeof(uint8_t));
+						*algorithm_data = strlen(valid_characters);
+					}
+					for (int i=0; i < *algorithm_data; i++) {
+						if (current_char == valid_characters[i]) {
+							fputc(current_char, output_file);
+						}
+					}
+					break;
+				default:
+					if (current_char != -1) {
+						fputc(current_char, output_file);
+					}
+					break;
+			}
+			if (algorithm_data) free(algorithm_data);
+		}
+		while (current_char != -1);
+		if (write_and_exit) return 0;
+	}
+	fclose(input_file);
+	fclose(output_file);
 	first_cell = calloc(CELL_COUNT, CELL_SIZE);
 	current_cell_pt = first_cell;
 	code_window = NULL;
@@ -451,48 +521,51 @@ int main(int argc, char **argv) {
 			refresh_state_window();
 			
 			int input = wgetch(stdscr);
-			switch (input) {
-				case 'Q':
-				case 'q':
-					endwin();
-					return 0;
-				case KEY_UP:
-					if (delay <= MIN_DELAY) beep();
-					else if ((delay / 2) % DELAY_INCREMENT) delay -= DELAY_INCREMENT;
-					else delay /= 2;
-					break;
-				case KEY_DOWN:
-					if (delay >= MAX_DELAY) beep();
-					else delay = min(delay*2, MAX_DELAY);
-					break;
-				case 'T':
-				case 't':
-					flags.step_by_step = !flags.step_by_step;
-					break;
-				case ' ':
-					if (flags.step_by_step) {
-						flags.next_instruction = 1;
-					}
-					break;
-			}
-			/*
-			if (flags.should_read_input) {
-				mvwprintw(input_window, 0, 0, "Program input: ");
-				curs_set(1);
-				wrefresh(input_window);
-				{
-					int user_input;
-					do user_input = wgetch(input_window);
-					while (user_input == ERR);
-					*current_cell_pt = (cell_t)user_input;
+			char *kname = keyname(input);
+			if (kname) {
+				if (kname[0] == '^') switch (kname[1]) {
+					case 'X': // Ctrl-X
+						endwin();
+						return 0;
+					case 'T': // Ctrl-T
+						flags.step_by_step = !flags.step_by_step;
+						input = ERR;
+						break;
+					case '@': // Ctrl-Space
+						if (flags.step_by_step) {
+							flags.next_instruction = 1;
+						}
+						input = ERR;
+						break;
 				}
-				curs_set(0);
-				wclear(input_window);
-				wrefresh(input_window);
-				flags.should_read_input = 0;
-				pthread_cond_signal(&input_cond);
+				else {
+					switch (input) {
+						case KEY_UP:
+							if (delay <= MIN_DELAY) beep();
+							else if ((delay / 2) % DELAY_INCREMENT) delay -= DELAY_INCREMENT;
+							else delay /= 2;
+							input = ERR;
+							break;
+						case KEY_DOWN:
+							if (delay >= MAX_DELAY) beep();
+							else delay = min(delay*2, MAX_DELAY);
+							input = ERR;
+					}
+				}
+				if ((input != 410) && flags.should_read_input && (input != ERR)) {
+					*current_cell_pt = (cell_t)input;
+					/*
+					// This isn't right
+					if (input == 127) {
+						bf_putc('\b');
+						bf_putc(' ');
+						bf_putc('\b');
+					}
+					else */bf_putc(input);
+					flags.should_read_input = 0;
+					pthread_cond_signal(&input_cond);
+				}
 			}
-			*/
 			usleep(20000);
 		}
 	}
