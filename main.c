@@ -89,6 +89,7 @@ static void *execute_bf_code(void *arg) {
 			instruction_pt++;
 			pthread_mutex_unlock(&instruction_pt_lock);
 			char *tmp_instruction_pt = instruction_pt;
+			int8_t multiplier = 0;
 			switch (input) {
 				case '<':
 					if (!(current_cell_pt - first_cell)) {
@@ -166,6 +167,28 @@ static void *execute_bf_code(void *arg) {
 					instruction_pt = tmp_instruction_pt;
 					pthread_mutex_unlock(&instruction_pt_lock);
 					break;
+
+				/* BEGIN: Optimized instructions */
+				/* We don't need to use pthread_mutex_lock; optimization is only done without curses */
+				case 0x02: // substract <num>
+					multiplier = -2;
+				case 0x01: // add <num>
+					multiplier += 1;
+					errno = 0;
+					(*current_cell_pt) += ((long)strtol(instruction_pt, &instruction_pt, 10)*multiplier);
+					if (errno) return;
+					break;
+				case 0x03: // move left <num> times
+					multiplier = -2;
+				case 0x04: // move right <num> times
+					multiplier += 1;
+					errno = 0;
+					int16_t change = (long)strtol(instruction_pt, &instruction_pt, 10) % CELL_COUNT;
+					if (errno) return;
+					current_cell_pt += (change * multiplier);
+					break;
+				/* END */
+
 				case '?':
 					*current_cell_pt = (cell_t)arc4random_uniform(256);
 					break;
@@ -452,8 +475,49 @@ int main(int argc, char **argv) {
 			}
 		}
 		code[written_bytes] = 0;
-		code = realloc(code, written_bytes+1);
-		code_len = written_bytes;
+		if (flags.no_curses) {
+			char *final_code = calloc(1, (buffer_size+1)*2); // Worst case scenario: Optimized code is 2 times bigger than the original
+			char *orig_code = code;
+			char *final_code_pt = final_code;
+			char orig_c, opt_c;
+			while ((orig_c = *(code++))) {
+				switch (orig_c) {
+					case '+':
+						opt_c = 0x01;
+						break;
+					case '-':
+						opt_c = 0x02;
+						break;
+					case '>':
+						opt_c = 0x04;
+						break;
+					case '<':
+						opt_c = 0x03;
+						break;
+					default:
+						opt_c = 0;
+				}
+				if (opt_c) {
+					uint32_t count = 1;
+					while ((*code) == orig_c) {
+						count++;
+						code++;
+					}
+					char buffer[12];
+					sprintf(buffer, "%c%u", opt_c, count);
+					sprintf(final_code_pt, "%s", buffer);
+					final_code_pt += strlen(buffer);
+				}
+				else {
+					*final_code_pt = orig_c;
+					final_code_pt++;
+				}
+			}
+			free(orig_code);
+			code = final_code;
+		}
+		code = realloc(code, strlen(code)+1);
+		code_len = strlen(code);
 		instruction_pt = code;
 	}
 	if (output_file) {
